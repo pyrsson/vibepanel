@@ -10,7 +10,7 @@
 //!
 //! 1. **Explicit config**: `device = N` in `[widgets.gpu]` selects a specific index.
 //! 2. **Auto heuristic** (default): Prefers discrete GPUs over integrated.
-//!    AMD discrete detection uses `boot_vga` sysfs (0 = discrete).
+//!    AMD discrete detection uses sysfs markers for dedicated boards/VRAM.
 //!    NVIDIA GPUs are always treated as discrete.
 //!    Falls back to index 0 if no discrete GPU is found.
 //!
@@ -117,7 +117,7 @@ struct AmdGpuDevice {
 
     device_name: Option<String>,
 
-    /// Whether this is a discrete GPU (determined via `boot_vga` sysfs attribute).
+    /// Whether this is a discrete GPU (determined via AMD sysfs dGPU markers).
     is_discrete: bool,
 }
 
@@ -504,9 +504,7 @@ impl GpuService {
                     let hwmon_path = discover_hwmon(&device_path);
                     let device_name = read_device_name(&device_path);
 
-                    // boot_vga: 1 = primary (typically integrated), 0 = secondary (typically discrete).
-                    let boot_vga = read_sysfs_u32(&device_path.join("boot_vga"));
-                    let is_discrete = boot_vga.map(|v| v == 0).unwrap_or(false);
+                    let is_discrete = is_amd_discrete_gpu(&device_path);
 
                     // Resolve the PCI device path for runtime_status.
                     // device_path is a symlink like /sys/class/drm/card1/device ->
@@ -699,6 +697,15 @@ fn read_device_name(device_path: &Path) -> Option<String> {
     ))
 }
 
+/// AMD's `boot_vga` only describes firmware boot display ownership, not whether
+/// the GPU is integrated or discrete. Prefer sysfs files that are exposed for
+/// dedicated AMD GPUs/boards.
+fn is_amd_discrete_gpu(device_path: &Path) -> bool {
+    device_path.join("mem_info_vram_vendor").exists()
+        || device_path.join("board_info").exists()
+        || device_path.join("unique_id").exists()
+}
+
 fn read_sysfs_u32(path: &Path) -> Option<u32> {
     let content = fs::read_to_string(path).ok()?;
     content.trim().parse::<u32>().ok()
@@ -734,6 +741,7 @@ fn read_runtime_status(path: &Path) -> GpuPowerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_gpu_snapshot_defaults() {
@@ -830,5 +838,31 @@ mod tests {
     fn test_select_gpu_none_config_uses_auto() {
         let devices = vec![dummy_amd("iGPU", false), dummy_amd("dGPU", true)];
         assert_eq!(GpuService::select_gpu(&devices, &None), Some(1));
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vibepanel-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn test_amd_discrete_detection_ignores_inverted_boot_vga() {
+        let root = unique_test_dir("amd-gpu-detection");
+        let igpu = root.join("igpu");
+        let dgpu = root.join("dgpu");
+        fs::create_dir_all(&igpu).unwrap();
+        fs::create_dir_all(&dgpu).unwrap();
+
+        fs::write(igpu.join("boot_vga"), "0\n").unwrap();
+        fs::write(dgpu.join("boot_vga"), "1\n").unwrap();
+        fs::write(dgpu.join("mem_info_vram_vendor"), "samsung\n").unwrap();
+
+        assert!(!is_amd_discrete_gpu(&igpu));
+        assert!(is_amd_discrete_gpu(&dgpu));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

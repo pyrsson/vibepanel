@@ -1048,15 +1048,16 @@ pub fn configure_popover_layer_anchors(window: &ApplicationWindow) {
             window.set_anchor(Edge::Left, false);
             window.set_anchor(Edge::Right, true);
         }
+        // Vertical bars anchor the top edge so revealed content grows downward.
         BarPosition::Left => {
-            window.set_anchor(Edge::Top, false);
-            window.set_anchor(Edge::Bottom, true);
+            window.set_anchor(Edge::Top, true);
+            window.set_anchor(Edge::Bottom, false);
             window.set_anchor(Edge::Left, true);
             window.set_anchor(Edge::Right, false);
         }
         BarPosition::Right => {
-            window.set_anchor(Edge::Top, false);
-            window.set_anchor(Edge::Bottom, true);
+            window.set_anchor(Edge::Top, true);
+            window.set_anchor(Edge::Bottom, false);
             window.set_anchor(Edge::Left, false);
             window.set_anchor(Edge::Right, true);
         }
@@ -1112,13 +1113,18 @@ pub fn calculate_popover_right_margin(
     }
 }
 
-pub fn calculate_popover_bottom_margin(
+pub fn calculate_popover_top_margin(
     anchor_y: i32,
     monitor_height: i32,
     window_height: i32,
     min_edge_margin: i32,
 ) -> i32 {
-    calculate_popover_right_margin(anchor_y, monitor_height, window_height, min_edge_margin)
+    calculate_popover_right_margin(
+        monitor_height - anchor_y,
+        monitor_height,
+        window_height,
+        min_edge_margin,
+    )
 }
 
 /// Get the appropriate keyboard mode for layer-shell popovers.
@@ -1269,6 +1275,7 @@ struct SurfaceHeightFreeze {
     blur_widget: glib::WeakRef<gtk4::Widget>,
     active: RefCell<Vec<gtk4::Revealer>>,
     frozen_height: Cell<i32>,
+    grow_upward: Cell<bool>,
     blur_generation: Cell<u32>,
 }
 
@@ -1279,6 +1286,7 @@ impl SurfaceHeightFreeze {
             blur_widget: blur_widget.as_ref().downgrade(),
             active: RefCell::new(Vec::new()),
             frozen_height: Cell::new(0),
+            grow_upward: Cell::new(false),
             blur_generation: Cell::new(0),
         })
     }
@@ -1331,10 +1339,42 @@ impl SurfaceHeightFreeze {
         let first = self.active.borrow().is_empty();
         self.active.borrow_mut().push(revealer.clone());
         self.frozen_height.set(target);
+        self.shift_up_if_overflowing(&window, target);
         self.apply(target);
         if first {
             self.start_blur_tracking();
         }
+    }
+
+    /// Vertical-bar popovers grow downward from a pinned top edge. If the
+    /// expanded surface would pass the bottom screen edge, raise the top margin
+    /// by the growth and bottom-pin the content so it grows upward instead.
+    fn shift_up_if_overflowing(&self, window: &ApplicationWindow, target: i32) {
+        if popover_bar_edge() == Edge::Top
+            || !window.is_layer_window()
+            || !window.is_anchor(Edge::Top)
+            || window.is_anchor(Edge::Bottom)
+        {
+            return;
+        }
+        let monitor = window.monitor().or_else(|| {
+            let surface = window.surface()?;
+            surface.display().monitor_at_surface(&surface)
+        });
+        let Some(monitor) = monitor else {
+            return;
+        };
+        let current = window.height();
+        let growth = target - current;
+        if current <= 0 || growth <= 0 {
+            return;
+        }
+        let top = window.margin(Edge::Top);
+        if top + target <= monitor.geometry().height() - POPOVER_MIN_EDGE_MARGIN {
+            return;
+        }
+        window.set_margin(Edge::Top, (top - growth).max(POPOVER_MIN_EDGE_MARGIN));
+        self.grow_upward.set(true);
     }
 
     fn begin_collapse(self: &Rc<Self>, revealer: &gtk4::Revealer) {
@@ -1366,7 +1406,8 @@ impl SurfaceHeightFreeze {
         };
         if let Some(widget) = window.child() {
             // Match the content alignment to the layer-shell edge anchoring.
-            widget.set_valign(if popover_bar_edge() == Edge::Top {
+            let top_pinned = window.is_anchor(Edge::Top) && !window.is_anchor(Edge::Bottom);
+            widget.set_valign(if top_pinned && !self.grow_upward.get() {
                 gtk4::Align::Start
             } else {
                 gtk4::Align::End
@@ -1428,6 +1469,7 @@ impl SurfaceHeightFreeze {
 
     fn release(&self) {
         self.frozen_height.set(0);
+        self.grow_upward.set(false);
         if let Some(window) = self.window.upgrade() {
             window.set_size_request(-1, -1);
             if let Some(widget) = window.child() {
@@ -1962,6 +2004,29 @@ impl LayerShellPopover {
             });
         });
 
+        // Content can resize after the open-time placement (e.g. notification
+        // "Show more" buttons appear on idle after map) and grow past the far
+        // screen edge. Only clamp rather than re-center, so the anchored edge
+        // stays still.
+        let weak_self = Rc::downgrade(self);
+        window.connect_realize(move |window| {
+            let Some(surface) = window.surface() else {
+                return;
+            };
+            for property in ["width", "height"] {
+                let weak_self = weak_self.clone();
+                surface.connect_notify_local(Some(property), move |surface, _| {
+                    if let Some(popover) = weak_self.upgrade()
+                        && popover.logically_open.get()
+                        && surface.width() > POPOVER_MIN_VALID_WIDTH
+                        && surface.height() > POPOVER_MIN_VALID_HEIGHT
+                    {
+                        popover.clamp_position_for_size(surface.width(), surface.height());
+                    }
+                });
+            }
+        });
+
         *self.window.borrow_mut() = Some(window.clone());
         window
     }
@@ -1998,6 +2063,43 @@ impl LayerShellPopover {
         self.update_position_for_size(None);
     }
 
+    /// Get monitor from anchor or fall back to primary.
+    fn placement_monitor(&self) -> Option<Monitor> {
+        self.anchor_monitor.borrow().clone().or_else(|| {
+            gdk::Display::default().and_then(|display| {
+                display
+                    .monitors()
+                    .item(0)
+                    .and_then(|obj| obj.downcast::<Monitor>().ok())
+            })
+        })
+    }
+
+    /// Reduce the far-edge margin only if the surface would overflow the
+    /// opposite screen edge at its current size.
+    fn clamp_position_for_size(&self, width: i32, height: i32) {
+        let Some(ref window) = *self.window.borrow() else {
+            return;
+        };
+        let Some(monitor) = self.placement_monitor() else {
+            return;
+        };
+        let geom = monitor.geometry();
+
+        let (edge, monitor_extent, window_extent) =
+            if ConfigManager::global().bar_position().is_horizontal() {
+                (Edge::Right, geom.width(), width)
+            } else {
+                (Edge::Top, geom.height(), height)
+            };
+
+        let max_margin =
+            (monitor_extent - window_extent - POPOVER_MIN_EDGE_MARGIN).max(POPOVER_MIN_EDGE_MARGIN);
+        if window.margin(edge) > max_margin {
+            window.set_margin(edge, max_margin);
+        }
+    }
+
     fn update_position_for_size(&self, size_override: Option<(i32, i32)>) {
         let Some(ref window) = *self.window.borrow() else {
             return;
@@ -2005,17 +2107,7 @@ impl LayerShellPopover {
 
         let anchor = self.anchor.get();
 
-        // Get monitor from anchor or fall back to primary
-        let monitor_opt = self.anchor_monitor.borrow().clone().or_else(|| {
-            gdk::Display::default().and_then(|display| {
-                display
-                    .monitors()
-                    .item(0)
-                    .and_then(|obj| obj.downcast::<Monitor>().ok())
-            })
-        });
-
-        let Some(monitor) = monitor_opt else {
+        let Some(monitor) = self.placement_monitor() else {
             return;
         };
 
@@ -2063,16 +2155,16 @@ impl LayerShellPopover {
                     POPOVER_DEFAULT_HEIGHT_ESTIMATE
                 }
             };
-            let bottom_margin = calculate_popover_bottom_margin(
+            let top_margin = calculate_popover_top_margin(
                 anchor.y,
                 geom.height(),
                 window_height,
                 POPOVER_MIN_EDGE_MARGIN,
             );
-            window.set_margin(Edge::Bottom, bottom_margin);
+            window.set_margin(Edge::Top, top_margin);
         } else {
             let fallback_margin = SurfaceStyleManager::global().shadow_margin(SHADOW_MARGIN);
-            window.set_margin(Edge::Bottom, fallback_margin);
+            window.set_margin(Edge::Top, fallback_margin);
         }
     }
 }
@@ -2135,12 +2227,14 @@ mod tests {
     fn popover_margin_centers_anchor_and_clamps_to_edges() {
         type MarginFn = fn(i32, i32, i32, i32) -> i32;
         let right: MarginFn = calculate_popover_right_margin;
-        let bottom: MarginFn = calculate_popover_bottom_margin;
+        let top: MarginFn = calculate_popover_top_margin;
         let cases = [
             ("right centered on anchor", right, 500, 1000, 400),
             ("right clamped near left edge", right, 20, 1000, 796),
             ("right clamped near right edge", right, 990, 1000, 4),
-            ("bottom uses same axis math", bottom, 400, 800, 300),
+            ("top centered on anchor", top, 400, 800, 300),
+            ("top clamped near top edge", top, 20, 800, 4),
+            ("top clamped near bottom edge", top, 790, 800, 596),
         ];
 
         for (name, margin, anchor, monitor, expected) in cases {

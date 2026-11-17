@@ -33,7 +33,7 @@ use crate::services::vpn::VpnService;
 use crate::styles::{qs, state, surface};
 use crate::widgets::layer_shell_popover::{
     AnimDirection, BarPopoverChrome, Dismissible, PopoverAnchor, SurfaceAnimation, animate_reveal,
-    calculate_popover_bar_margin, calculate_popover_bottom_margin, calculate_popover_right_margin,
+    calculate_popover_bar_margin, calculate_popover_right_margin, calculate_popover_top_margin,
     configure_popover_layer_anchors, install_surface_height_freeze, popover_bar_edge,
     popover_keyboard_mode, reset_popover_margins, setup_esc_handler,
 };
@@ -1406,19 +1406,19 @@ impl QuickSettingsWindow {
                     + QUICK_SETTINGS_POPOVER_PADDING
                     + 2 * shadow_m
             };
-            let bottom_margin = calculate_popover_bottom_margin(
+            let top_margin = calculate_popover_top_margin(
                 anchor.y,
                 geom.height(),
                 window_height,
                 QUICK_SETTINGS_MIN_EDGE_MARGIN,
             );
-            self.window.set_margin(Edge::Bottom, bottom_margin);
+            self.window.set_margin(Edge::Top, top_margin);
         } else if is_horizontal {
             self.window
                 .set_margin(Edge::Right, QUICK_SETTINGS_DEFAULT_RIGHT_MARGIN);
         } else {
             self.window
-                .set_margin(Edge::Bottom, QUICK_SETTINGS_MIN_EDGE_MARGIN);
+                .set_margin(Edge::Top, QUICK_SETTINGS_MIN_EDGE_MARGIN);
         }
     }
 

@@ -131,7 +131,7 @@ fn expect_popover_anchor(position: BarPosition, edge: gtk4_layer_shell::Edge) ->
     edge == bar_edge_for_position(position)
         || match edge {
             gtk4_layer_shell::Edge::Right => position.is_horizontal(),
-            gtk4_layer_shell::Edge::Bottom => position.is_vertical(),
+            gtk4_layer_shell::Edge::Top => position.is_vertical(),
             _ => false,
         }
 }
